@@ -23,5 +23,13 @@
     <ClCompile Include="malloc.c">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
+    <ClCompile Include="main.c">
+      <Filter>Исходные файлы</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="README.md">
+      <Filter>Исходные файлы</Filter>
+    </None>
   </ItemGroup>
 </Project>

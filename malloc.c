@@ -1,411 +1,442 @@
-﻿#include <windows.h>
+﻿#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include "malloc.h"
 
-// Конфигурация аллокатора
-
-#define ALIGNMENT 16 // Выравнивание: 16 байт как в glibc
-
-// Округление размера вверх до кратного ALIGNMENT
-// ример для 16: ALIGN(1)=16, ALIGN(17)=32, ALIGN(16)=16
+// Конфигурация
+#define ALIGNMENT 16 // Выравнивание блоков: 16 байт
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
 
-// Размер заголовка с учётом выравнивания
-#define HEADER_SIZE ALIGN(sizeof(BlockHeader))
+#define HEADER_SIZE ALIGN(sizeof(BlockHeader)) // Размер заголовка блока
+#define MIN_BLOCK_SIZE (HEADER_SIZE + 16)  // Минимальный блок: заголовок + 16 байт данных
 
-// Размер footer
-#define FOOTER_SIZE sizeof(BlockFooter)
+#define MAGIC_COOKIE 0xDEADBEEF  // Сигнатура для проверки целостности блоков
 
-// Суммарный объём метаданных на один блок
-#define METADATA_SIZE (HEADER_SIZE + FOOTER_SIZE)
-
-// Минимальный размер блока: метаданные + 16 байт на данные
-// Блоки меньшего размера бессмысленны - некуда класть полезные данные
-#define MIN_BLOCK_SIZE (METADATA_SIZE + 16)
-
-// Сегрегация: 4 списка для блоков разного размера
-// Ускоряет поиск и уменьшает фрагментацию
-#define NUM_LISTS 4
-#define LIST_0_MAX 64  // Мелкие блоки
-#define LIST_1_MAX 256  // Средние
-#define LIST_2_MAX 1024 // Крупные
-#define LIST_3_MAX SIZE_MAX // Огромные
-
-#define MAGIC_COOKIE 0xDEADBEEF // Сигнатура для проверки целостности блоков
-
-// Структуры метаданных
-
-// Каждый блок памяти (и свободный, и занятый) имеет заголовок и footer
-// Footer хранит копию размера для O(1) доступа к предыдущему блоку при слиянии
-// Оба содержат magic cookie для обнаружения повреждений памяти
+// Заголовок блока памяти
+// Каждый блок (и свободный, и занятый) начинается с этого заголовка
+// Свободные блоки объединены в двусвязный список для быстрого поиска
 typedef struct BlockHeader {
-	size_t size; // Размер всего блока (header + данные + footer)
-	int free; // 1 - свободен. 0 - занят
-	struct BlockHeader* next; // Указатели для двусвязного списка свободных
-	struct BlockHeader* prev;
-	uint32_t cookie; // Сигнатура MAGIC_COOKIE
+    size_t size; // Размер всего блока (заголовок + данные)
+    int    free; // // Флаг: 1 - свободен, 0 - занят
+    struct BlockHeader* next; // Следующий свободный блок в списке
+    struct BlockHeader* prev; // Предыдущий свободный блок в списке
+    uint32_t cookie;
 } BlockHeader;
 
-typedef struct BlockFooter {
-	size_t size; // Дублирует размер из header
-	uint32_t cookie; // Сигнатура MAGIC_COOKIE
-} BlockFooter;
-
 // Глобальное состояние аллокатора
+static BlockHeader* free_list = NULL; // Голова списка свободных блоков
+static void* heap_start = NULL; // Начало выделенной памяти
+static void* heap_end = NULL; // Конец выделенной памяти
+static HANDLE heap = NULL; // Хендл кучи Windows (для HeapAlloc/HeapFree)
 
-static BlockHeader* free_lists[NUM_LISTS] = { NULL }; // Сегрегированные списки
-static void* heap_start = NULL; // Начало кучи
-static void* heap_end = NULL; // Текущий конец кучи
+// Статистика
+static size_t total_allocated = 0; // Общий объём выделенной памяти
 
-// Статистика для отладки и анализа
-static size_t total_allocated = 0; // Сколько всего запрошено у ОС
-static size_t total_freed = 0; // Сколько освобождено (сумма размеров)
-static size_t peak_memory = 0; // Пиковое использование
-static size_t allocation_count = 0; // Счётчик вызовов my_malloc
-static size_t free_count = 0; // Счётчик вызовов my_free
+// Вспомогательные функции
 
-// Внутренние вспомогательные функции
-
-// Получает footer блока по его header
-static inline BlockFooter* get_footer(BlockHeader* header) {
-	// Footer находится в конце блока: header + size - FOOTER_SIZE
-	return (BlockFooter*)((char*)header + header->size - FOOTER_SIZE);
+// По указателю на заголовок блока возвращает указатель на пользовательские данные
+// Пользовательские данные начинаются сразу после заголовка
+static void* get_user_ptr(BlockHeader* block) {
+    return (void*)((char*)block + HEADER_SIZE);
 }
 
-// Получает следующий физический блок (не по списку, а по адресу в памяти)
-// Используется для слияния соседних блоков и обхода кучи
-static inline BlockHeader* get_next_block(BlockHeader* block) {
-	if ((char*)block + block->size >= (char*)heap_end) {
-		return NULL; // Достигли конца кучи
-	}
-	return (BlockHeader*)((char*)block + block->size);
+// По пользовательскому указателю возвращает указатель на заголовок блока
+// Заголовок находится непосредственно перед данными
+static BlockHeader* get_block(void* ptr) {
+    return (BlockHeader*)((char*)ptr - HEADER_SIZE);
 }
 
-// Получает предыдущий физический блок за O(1)
-// Ключевая оптимизация: footer предыдущего блока лежит прямо перед нашим header
-// Без footer пришлось бы проходить всю кучу от начала
-static inline BlockHeader* get_prev_block(BlockHeader* block) {
-	if ((char*)block == (char*)heap_start) {
-		return NULL; // Это первый блок в куче
-	}
+// Инициализирует кучу при первом вызове my_malloc
+// Использует Windows API для выделения большого непрерывного блока (50 MB), внутри которого аллокатор будет управлять памятью
+// Это избавляет от необходимости дробить память системными вызовами
+static int init_heap(void) {
+    // Создаём отдельную кучу Windows
+    heap = HeapCreate(0, 50 * 1024 * 1024, 0);
 
-	// Footer предыдущего блока находится прямо перед нашим header
-	BlockFooter* prev_footer = (BlockFooter*)((char*)block - FOOTER_SIZE);
+    if (!heap) {
+        printf(stderr, "Ошибка: не удалось создать кучу");
+        return -1;
+    }
 
-	if (prev_footer->cookie != MAGIC_COOKIE) {
-		return NULL; // Целостность нарушена
-	}
+    // Выделяем в ней 50 MB непрерывной памяти
+    void* mem = HeapAlloc(heap, HEAP_ZERO_MEMORY, 50 * 1024 * 1024);
 
-	// Адрес предыдущего блока = наш адрес - его размер
-	return (BlockHeader*)((char*)block - prev_footer->size);
+    if (!mem) {
+        printf(stderr, "Ошибка: не удалось выделить память из кучи\n");
+        HeapDestroy(heap);
+        return -1;
+    }
+
+    heap_start = mem;
+    heap_end = (char*)mem + 50 * 1024 * 1024;
+
+    // Оформляем всю память как один большой свободный блок
+    BlockHeader* block = (BlockHeader*)mem;
+    block->size = 50 * 1024 * 1024;
+    block->free = 1;
+    block->next = NULL;
+    block->prev = NULL;
+    block->cookie = MAGIC_COOKIE;
+    free_list = block;
+
+    total_allocated = 50 * 1024 * 1024;
+    return 0;
 }
 
+// Поиск свободного блока по алгоритму Best Fit
+// Best Fit ищет наименьший блок, достаточный для размещения данных
+// Это уменьшает фрагментацию, но требует полного обхода списка
+static BlockHeader* find_free_block(size_t total_size) {
+    BlockHeader* cur = free_list;
+    BlockHeader* best = NULL;
+    size_t best_size = SIZE_MAX;
 
-// Определяет, в какой из сегрегированных списков попадёт блок данного размера
-// Мелкие блоки ищутся быстрее (короткие списки), крупные - в отдельных списках
-static inline int get_list_index(size_t size) {
-	size_t data_size = size - METADATA_SIZE;
+    while (cur) {
+        if (cur->free && cur->size >= total_size) {
+            // Нашли подходящий блок
+            if (cur->size < best_size) {
+                best = cur;
+                best_size = cur->size;
 
-	if (data_size <= LIST_0_MAX) return 0;
-	if (data_size <= LIST_1_MAX) return 1;
-	if (data_size <= LIST_2_MAX) return 2;
-	return 3;
+                // Точное совпадение - идеальный вариант, дальше не ищем
+                if (cur->size == total_size)
+                    return cur;
+            }
+        }
+        cur = cur->next;
+    }
+
+    return best;
 }
 
+// Разделяет блок на два, если остаток после выделения >= MIN_BLOCK_SIZE
+// Это предотвращает расточительство: не отдаём 4KB под запрос в 16 байт
+// Остаток оформляется как новый свободный блок и остаётся в списке
+static BlockHeader* split_block(BlockHeader* block, size_t data_size) {
+    size_t needed = HEADER_SIZE + data_size;  // data_size уже выровнен
 
-// Инициализирует блок: заполняет header и footer, прописывает размер и cookie
-static void init_block(BlockHeader* block, size_t size, int free_flag) {
-	block->size = size;
-	block->free = free_flag;
-	block->next = NULL;
-	block->prev = NULL;
-	block->cookie = MAGIC_COOKIE;
+    // Если остаток слишком мал - не разделяем
+    if (block->size - needed < MIN_BLOCK_SIZE) return block;
 
-	BlockFooter* footer = get_footer(block);
-	footer->size = size;
-	footer->cookie = MAGIC_COOKIE;
+    // Создаём новый свободный блок из остатка
+    BlockHeader* new_block = (BlockHeader*)((char*)block + needed);
+    new_block->size = block->size - needed;
+    new_block->free = 1;
+    new_block->next = block->next;
+    new_block->prev = block;
+    new_block->cookie = MAGIC_COOKIE;
+
+    // Урезаем текущий блок до нужного размера
+    block->size = needed;
+    block->next = new_block;
+
+    // Поправляем указатели соседа в двусвязном списке
+    if (new_block->next) new_block->next->prev = new_block;
+
+    if (free_list == block) free_list = new_block;
+
+    return block;
 }
 
-// Вставляет блок в начало соответствующего сегрегированного списка
-// LIFO (в начало) - быстрее, чем вставка с сортировкой
-static void insert_free_block(BlockHeader* block) {
-	int index = get_list_index(block->size);
-	BlockHeader** list = &free_lists[index];
+// Удаляет блок из списка свободных
+//  Используется, когда блок выделяется пользователю или поглощается при слиянии
+static void remove_from_free_list(BlockHeader* block) {
+    // Если удаляем голову списка - сдвигаем голову
+    if (free_list == block) free_list = block->next;
 
-	block->prev = *list;
-	block->next = NULL;
+    // Перелинковываем соседей
+    if (block->prev) block->prev->next = block->next;
+    if (block->next) block->next->prev = block->prev;
 
-	if (*list != NULL) {
-		(*list)->prev = block;
-	}
-
-	*list = block;
-	block->free = 1;
+    block->next = block->prev = NULL;
 }
 
-
-// Удаляет блок из списка свободных (двусвязный список - удаление за O(1))
-static void remove_free_block(BlockHeader* block) {
-	int index = get_list_index(block->size);
-	BlockHeader** list = &free_lists[index];
-
-	if (*list == block) {
-		*list = block->next;
-		if (block->next) {
-			block->next->prev = NULL;
-		}
-	}
-	else {
-		if (block->prev) {
-			block->prev->next = block->next;
-		}
-		if (block->next) {
-			block->next->prev = block->prev;
-		}
-	}
-
-	block->next = NULL;
-	block->prev = NULL;
-}
-
-// Сливает освобождённый блок с соседними свободными блоками
+// Сливает освобождённый блок с физическими соседями
 // Это ключевой механизм борьбы с внешней фрагментацией
 // Возвращает указатель на объединённый блок
 static BlockHeader* merge_blocks(BlockHeader* block) {
-	// Пробуем слить со следующим
-	BlockHeader* next = get_next_block(block);
+    // 1. Слияние со следующим физическим блоком
+    // Следующий блок находится сразу после текущего
+    BlockHeader* next_phys = (BlockHeader*)((char*)block + block->size);
 
-	if (next != NULL && next->free) {
-		remove_free_block(next);
-		block->size += next->size;
-	}
+    if ((char*)next_phys < (char*)heap_end && next_phys->free) {
+        remove_from_free_list(next_phys); // Убираем соседа из списка
+        block->size += next_phys->size;  // Поглощаем его память
+    }
 
-	// Пробуем слить с предыдущим
-	BlockHeader* prev = get_prev_block(block);
+    // 2. Слияние с предыдущим физическим блоком
+    // Ищем в списке свободных блок, который заканчивается ровно там, где начинается текущий
+    BlockHeader* cur = free_list;
 
-	if (prev != NULL && prev->free) {
-		remove_free_block(prev);
-		prev->size += block->size;
+    while (cur) {
+        if ((char*)cur + cur->size == (char*)block && cur->free) {
+            // Убираем текущий из списка
+            remove_from_free_list(block);
 
-		// Обновляем footer обьединенного блока
-		BlockFooter* footer = get_footer(prev);
-		footer->size = prev->size;
-		footer->cookie = MAGIC_COOKIE;
+            // Предыдущий поглощает текущий
+            cur->size += block->size;
 
-		return prev; // Позвращаем более ранний блок
-	}
+            // Возвращаем объединённый блок
+            return cur;
+        }
 
-	// Обновляем footer текущего блока
-	BlockFooter* footer = get_footer(block);
-	footer->size = block->size;
-	footer->cookie = MAGIC_COOKIE;
+        cur = cur->next;
+    }
 
-	return block;
+    return block; // Слияния не произошло
 }
 
-
-// Разделяет блок, если он значительно больше запрошенного размера
-// Остаток оформляется как новый свободный блок
-// Предотвращает расточительство: не отдаём 4KB под запрос в 16 байт
-static void split_block(BlockHeader* block, size_t requested_size) {
-	size_t remaining = block->size - requested_size;
-
-	if (remaining >= MIN_BLOCK_SIZE) {
-		// Создаем новый блок из остатка
-		BlockHeader* new_block = (BlockHeader*)((char*)block + requested_size);
-		init_block(new_block, remaining, 1);
-
-		// Урезаем текущий блок
-		block->size = requested_size;
-		BlockFooter* footer = get_footer(block);
-		footer->size = requested_size;
-		footer->cookie = MAGIC_COOKIE;
-
-		// Остаток - в список свободных
-		insert_free_block(new_block);
-	}
-}
-
-
-// Запрашивает новую память у ОС через VirtualAlloc (Windows API)
-// Всегда запрашивает минимум 4KB (размер страницы) для эффективности
-static BlockHeader* request_memory(size_t size) {
-	size_t request_size = (size < 4096) ? 4096 : ALIGN(size);
-
-	// VirtualAlloc резервирует и выделяет страницы виртуальной памяти
-	void* mem = VirtualAlloc(
-		NULL, // Система сама выберет адрес
-		request_size, // Размер региона
-		MEM_COMMIT | MEM_RESERVE, // Зарезервировать и выделить
-		PAGE_READWRITE // Доступ на чтение и запись
-	);
-
-	if (mem == NULL) {
-		return NULL; // ОС отказала в памяти
-	}
-
-	if (heap_start == NULL) {
-		heap_start = mem; // Первый запрос - запоминаем начало кучи
-	}
-
-	heap_end = (char*)mem + request_size;
-
-	BlockHeader* block = (BlockHeader*)mem;
-	init_block(block, request_size, 0);
-
-	total_allocated += request_size;
-	if (total_allocated > peak_memory) {
-		peak_memory = total_allocated;
-	}
-
-	return block;
-}
-
-
-// Пытается вернуть память ОС, если последний блок в куче свободен
-// Использует VirtualFree для освобождения целых регионов
-static void try_return_memory(void) {
-	if (heap_start == NULL) return;
-
-	// Находим последний физический блок
-	BlockHeader* current = (BlockHeader*)heap_start;
-	BlockHeader* last_block = NULL;
-
-	while (current != NULL && (void*)current < heap_end) {
-		last_block = current;
-		current = get_next_block(current);
-	}
-
-	if (last_block != NULL && last_block->free) {
-		// Проверяем, что это действительно последний блок
-		if ((char*)last_block + last_block->size == heap_end) {
-			remove_free_block(last_block);
-
-			size_t shrink = last_block->size;
-
-			// Освобождаем регион виртуальной памяти
-			VirtualFree(last_block, 0, MEM_RELEASE);
-
-			heap_end = (char*)heap_end - shrink;
-			total_allocated -= shrink;
-
-			if (heap_start == heap_end) {
-				heap_start = NULL; // Куча полностью пуста
-			}
-		}
-	}
-}
-
-// Поиск свободного блока по алгоритму best-fit
-// Ищет наименьший подходящий блок во всех списках, начиная с подходящего по размеру
-// При точном совпадении размера сразу возвращает блок
-static BlockHeader* find_bect_fit(size_t size) {
-	int start_index = get_list_index(size);
-	BlockHeader* best = NULL;
-	size_t best_size = SIZE_MAX;
-
-	// Проходим по спискам от подходящего до огромных
-	for (int i = start_index; i < NUM_LISTS; i++) {
-		BlockHeader* current = free_lists[i];
-
-		while (current != NULL) {
-			if (current->size >= size && current->size < best_size) {
-				best = current;
-				best_size = current->size;
-
-				// Точное совпадение - идеальный вариант
-				if (current->size == size) {
-					return current;
-				}
-			}
-
-			current = current->next;
-		}
-
-		// Если нашли хороший блок в текущем списке - возвращаем
-		if (best != NULL) {
-			return best;
-		}
-	}
-
-	return NULL;
-}
+// Основные функции
 
 // Выделяет блок памяти размером size байт
+// Память не инициализируется
 void* my_malloc(size_t size) {
-	if (size == 0) {
-		return NULL;
-	}
+    if (size == 0) return NULL;
 
-	// Вычисляем полный размер с метаданными и выравниванием
-	size_t total_size = ALIGN(size) + METADATA_SIZE;
-	if (total_size < MIN_BLOCK_SIZE) {
-		total_size = MIN_BLOCK_SIZE;
-	}
+    // Ленивая инициализация: при первом вызове выделяем 50 MB у ОС
+    if (!heap_start) {
+        if (init_heap() != 0) return NULL;
+    }
 
-	// Ищем подходящий свободный блок
-	BlockHeader* block = find_bect_fit(total_size);
+    // Вычисляем полный размер с заголовком и выравниванием
+    size_t aligned = ALIGN(size);
+    size_t total = HEADER_SIZE + aligned;
 
-	if (block != NULL) {
-		remove_free_block(block);
+    // Ищем подходящий свободный блок
+    BlockHeader* block = find_free_block(total);
+    if (!block) {
+        printf("Ошибка: недостаточно памяти (запрошено %zu байт)\n", size);
+        return NULL;
+    }
 
-		// Проверяем целостность перед использованием
-		if (block->cookie != MAGIC_COOKIE) {
-			return NULL;
-		}
+    // Разделяем блок, если он слишком большой
+    block = split_block(block, aligned);
+    block->free = 0;
 
-		split_block(block, total_size); // Отрезаем лишнее
-		block->size = 0;
-	}
-	else {
-		// Нет подходящего блока - запрашиваем у ОС
-		block = request_memory(total_size);
-		if (block == NULL) {
-			return NULL;
-		}
-		split_block(block, total_size);
-	}
-	allocation_count++;
+    // Убираем из списка свободных - теперь он занят
+    remove_from_free_list(block);
 
-	// Возвращаем указатель на пользовательские данные (после header)
-	return (void*)((char*)block + HEADER_SIZE);
+    if (block->cookie != MAGIC_COOKIE) {
+        printf("ОШИБКА: повреждён заголовок блока\n");
+        return NULL;
+    }
+
+    return get_user_ptr(block);
 }
 
-
 // Освобождает ранее выделенный блок памяти
+// Автоматически сливается с соседними свободными блоками
 void my_free(void* ptr) {
-	if (ptr == NULL) {
-		return;
-	}
+    if (!ptr) return;
 
-	// Получаем header по пользовательскому указателю
-	BlockHeader* block = (BlockHeader*)((char*)ptr - HEADER_SIZE);
+    // Защита от двойного освобождения
+    BlockHeader* block = get_block(ptr);
 
-	// Проверка целостности
-	if (block->cookie != MAGIC_COOKIE) {
-		return; // Повреждение памяти - тихо игнорируем
-	}
+    if (block->cookie != MAGIC_COOKIE) {
+        printf("ОШИБКА: повреждён заголовок при освобождении\n");
+        return;
+    }
 
-	if (block->free) {
-		return; // Двойное освобождение - игнорируем
-	}
+    if (block->free) {
+        return;
+    }
 
-	block->free = 1;
-	free_count++;
-	total_freed += block->size;
+    block->free = 1;
 
-	// Шаг 1: вставляем в список свободных
-	insert_free_block(block);
+    // Вставляем в начало списка свободных
+    block->next = free_list;
+    block->prev = NULL;
+    if (free_list) free_list->prev = block;
+    free_list = block;
 
-	// Шаг 2: сливаем с соседями (если они тоже свободны)
-	BlockHeader* merged = merge_blocks(block);
+    // Объединяем с соседями для борьбы с фрагментацией
+    merge_blocks(block);
+}
 
-	// Если merged != block - нас поглотил предыдущий блок, он уже в списке
-	// Если merged == block - мы уже вставили блок в список ранее (insert_free_block)
+// Выделяет и обнуляет память под массив из nmemb элементов по size байт
+void* my_calloc(size_t nmemb, size_t size) {
+    if (nmemb == 0 || size == 0) return NULL;
 
-	// Шаг 3: пробуем вернуть память ОС
+    // Проверка на переполнение умножения
+    size_t total = nmemb * size;
+    if (total / nmemb != size) return NULL;
 
-	try_return_memory();
+    void* ptr = my_malloc(total);
+    if (ptr) memset(ptr, 0, total); // Обнуляем выделенную память
+    return ptr;
+}
+
+// Изменяет размер ранее выделенного блока
+// Если новый размер меньше или равен старому - возвращает тот же указатель
+// Иначе выделяет новый блок, копирует данные и освобождает старый
+void* my_realloc(void* ptr, size_t size) {
+    if (!ptr) return my_malloc(size); // realloc(NULL, size) = malloc(size)
+
+    if (size == 0) { my_free(ptr); return NULL; } // realloc(ptr, 0) = free(ptr)
+
+    BlockHeader* block = get_block(ptr);
+    size_t old_data_size = block->size - HEADER_SIZE;
+
+    // Если данные помещаются в текущий блок - ничего не делаем
+    if (size <= old_data_size) return ptr;
+
+    // Выделяем новый блок и копируем данные
+    void* new_ptr = my_malloc(size);
+
+    if (new_ptr) {
+        memcpy(new_ptr, ptr, old_data_size);
+        my_free(ptr);
+    }
+
+    return new_ptr;
+}
+
+// Отладочные функции
+
+// Выводит сводную статистику: размер кучи, занято/свободно, количество блоков, фрагментацию, целостность
+void print_heap_stats(void) {
+    printf("\nСтатистика кучи\n");
+    printf("Начало кучи: %p\n", heap_start);
+    printf("Конец кучи: %p\n", heap_end);
+    printf("Размер кучи: %zu байт (%.2f MB)\n", (size_t)((char*)heap_end - (char*)heap_start), (float)((char*)heap_end - (char*)heap_start) / (1024 * 1024));
+
+    // Обходим все блоки физически и собираем статистику
+    int total_blocks = 0, free_blocks = 0;
+    size_t total_memory = 0, free_memory = 0;
+
+    BlockHeader* cur = (BlockHeader*)heap_start;
+    while ((char*)cur < (char*)heap_end) {
+        total_blocks++;
+        total_memory += cur->size;
+
+        if (cur->free) {
+            free_blocks++;
+            free_memory += cur->size;
+        }
+
+        cur = (BlockHeader*)((char*)cur + cur->size);
+    }
+
+    printf("Всего блоков: %d\n", total_blocks);
+    printf("Свободных блоков: %d\n", free_blocks);
+    printf("Занятая память: %zu байт (%.2f KB)\n", total_memory - free_memory, (float)(total_memory - free_memory) / 1024);
+    printf("Свободная память: %zu байт (%.2f KB)\n", free_memory, (float)free_memory / 1024);
+    printf("Использование памяти: %.1f%%\n", (float)(total_memory - free_memory) / total_memory * 100);
+
+    if (validate_heap())
+        printf("Целостность кучи: OK\n");
+    else
+        printf("Целостность кучи: ПОВРЕЖДЕНА\n");
+}
+
+// Выводит содержимое списка свободных блоков
+void print_free_lists(void) {
+    printf("\nСписок свободных блоков\n");
+    BlockHeader* cur = free_list;
+    int count = 0;
+    size_t total_free = 0;
+
+    while (cur) {
+        printf("Блок %d: адрес=%p, размер=%zu байт (%.2f KB), свободен=%d\n", count, (void*)cur, cur->size, (float)cur->size / 1024, cur->free);
+        total_free += cur->size;
+        cur = cur->next;
+        count++;
+    }
+
+    if (count == 0)
+        printf("Нет свободных блоков\n");
+    else
+        printf("Всего свободно: %zu байт (%.2f KB)\n", total_free, (float)total_free / 1024);
+}
+
+// Суммарный объём свободной памяти (в байтах)
+size_t get_total_free_memory(void) {
+    size_t total = 0;
+    BlockHeader* cur = free_list;
+    while (cur) { total += cur->size; cur = cur->next; }
+    return total;
+}
+
+// Количество свободных блоков
+size_t get_free_block_count(void) {
+    size_t count = 0;
+    BlockHeader* cur = free_list;
+    while (cur) { count++; cur = cur->next; }
+    return count;
+}
+
+// Общий объём памяти, выделенной у ОС
+size_t get_total_allocated_memory(void) {
+    return total_allocated;
+}
+
+// Коэффициент внешней фрагментации [0; 1]
+// 0 - вся свободная память в одном блоке (идеально)
+// 1 - память раздроблена на мельчайшие кусочки
+double get_fragmentation_ratio(void) {
+    size_t free_mem = get_total_free_memory();
+    if (free_mem == 0) return 0.0;
+
+    // Находим крупнейший свободный блок
+    size_t largest = 0;
+    BlockHeader* cur = free_list;
+
+    while (cur) {
+        if (cur->size > largest) largest = cur->size;
+        cur = cur->next;
+    }
+
+    return 1.0 - ((double)largest / (double)free_mem);
+}
+
+// Проверяет, указывает ли ptr на валидный выделенный блок
+int is_block_valid(void* ptr) {
+    if (!ptr) return 0;
+    BlockHeader* block = get_block(ptr);
+    if (block->cookie != MAGIC_COOKIE) return 0;
+
+    if (block->free) return 0; // Блок уже освобождён
+
+    if (block->size < MIN_BLOCK_SIZE || block->size > 1024 * 1024 * 1024) return 0;
+    return 1;
+}
+
+// Проверяет целостность всей кучи:
+// Размеры блоков корректны и выровнены
+// Блоки не выходят за границы кучи
+// Нет блоков меньше минимального размера
+int validate_heap(void) {
+    if (!heap_start) return 1; // Куча ещё не инициализирована
+
+    BlockHeader* cur = (BlockHeader*)heap_start;
+    while ((char*)cur < (char*)heap_end) {
+        if (cur->cookie != MAGIC_COOKIE) {
+            printf("ОШИБКА: повреждён cookie блока %p\n", (void*)cur);
+            return 0;
+        }
+
+        // Проверка на нулевой размер
+        if (cur->size == 0) {
+            printf("ОШИБКА: нулевой размер блока\n");
+            return 0;
+        }
+
+        // Проверка выхода за границы кучи
+        if ((char*)cur + cur->size > (char*)heap_end) {
+            printf("ОШИБКА: блок %p выходит за границу кучи\n", (void*)cur);
+            return 0;
+        }
+
+        // Проверка минимального размера
+        if (cur->size < MIN_BLOCK_SIZE) {
+            printf("ОШИБКА: блок %p меньше минимального\n", (void*)cur);
+            return 0;
+        }
+
+        // Переходим к следующему физическому блоку
+        cur = (BlockHeader*)((char*)cur + cur->size);
+    }
+    return 1;
 }
